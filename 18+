@@ -1,0 +1,230 @@
+// File: app/page.tsx (Next.js 14 using App Router)
+
+import Link from 'next/link';
+import { Button } from '@/components/ui/button';
+
+export default function HomePage() {
+  return (
+    <main className="flex min-h-screen flex-col items-center justify-center p-4 bg-black text-white">
+      <h1 className="text-4xl font-bold mb-6">🔞 Age Verification</h1>
+      <p className="mb-4">You must be 18+ to continue to this site.</p>
+      <Button onClick={() => localStorage.setItem('age_verified', 'true')} asChild>
+        <Link href="/dashboard">I am 18 or older</Link>
+      </Button>
+    </main>
+  );
+}
+
+// File: app/dashboard/page.tsx
+import { getSession } from '@/lib/auth';
+import { redirect } from 'next/navigation';
+import { Button } from '@/components/ui/button';
+
+export default async function DashboardPage() {
+  const session = await getSession();
+  if (!session) redirect('/api/auth/login');
+
+  return (
+    <div className="p-8 text-white bg-gray-900 min-h-screen">
+      <h2 className="text-3xl font-semibold mb-4">Welcome, {session.user.username}</h2>
+      <p className="mb-4">Choose a subscription to unlock roles and exclusive content.</p>
+      <a href="/subscribe">
+        <Button>View Subscription Tiers</Button>
+      </a>
+    </div>
+  );
+}
+
+// File: app/subscribe/page.tsx
+'use client';
+
+import { useState } from 'react';
+import { Button } from '@/components/ui/button';
+
+const tiers = [
+  { name: 'Bronze', priceId: 'price_123', roleId: 'role_123', price: '$5/month' },
+  { name: 'Silver', priceId: 'price_456', roleId: 'role_456', price: '$10/month' },
+  { name: 'Gold', priceId: 'price_789', roleId: 'role_789', price: '$20/month' },
+];
+
+export default function SubscribePage() {
+  const [loading, setLoading] = useState(false);
+
+  const subscribe = async (priceId: string, roleId: string) => {
+    setLoading(true);
+    const res = await fetch('/api/subscribe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ priceId, roleId }),
+    });
+    const data = await res.json();
+    if (data.url) window.location.href = data.url;
+    setLoading(false);
+  };
+
+  return (
+    <main className="p-6 text-white bg-black min-h-screen">
+      <h1 className="text-3xl font-bold mb-4">Choose a Subscription Tier</h1>
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+        {tiers.map(tier => (
+          <div key={tier.name} className="border border-gray-700 rounded-2xl p-6 bg-gray-800">
+            <h2 className="text-xl font-semibold mb-2">{tier.name}</h2>
+            <p className="mb-4">{tier.price}</p>
+            <Button disabled={loading} onClick={() => subscribe(tier.priceId, tier.roleId)}>
+              Subscribe
+            </Button>
+          </div>
+        ))}
+      </div>
+    </main>
+  );
+}
+
+// File: app/success/page.tsx
+
+export default function SuccessPage() {
+  return (
+    <main className="flex items-center justify-center min-h-screen bg-green-900 text-white p-6">
+      <div className="text-center">
+        <h1 className="text-4xl font-bold mb-4">✅ Subscription Successful!</h1>
+        <p className="mb-4">You've been subscribed and your role will be added in the Discord server shortly.</p>
+        <a href="/dashboard" className="underline">Return to Dashboard</a>
+      </div>
+    </main>
+  );
+}
+
+// File: app/cancel/page.tsx
+
+export default function CancelPage() {
+  return (
+    <main className="flex items-center justify-center min-h-screen bg-red-900 text-white p-6">
+      <div className="text-center">
+        <h1 className="text-4xl font-bold mb-4">❌ Subscription Cancelled</h1>
+        <p className="mb-4">You have canceled the checkout process. No changes were made.</p>
+        <a href="/subscribe" className="underline">Try Again</a>
+      </div>
+    </main>
+  );
+}
+
+// File: lib/auth.ts (Discord OAuth)
+import { getServerSession } from 'next-auth';
+import { authOptions } from './authOptions';
+
+export async function getSession() {
+  return await getServerSession(authOptions);
+}
+
+// File: lib/authOptions.ts
+import DiscordProvider from 'next-auth/providers/discord';
+import type { NextAuthOptions } from 'next-auth';
+
+export const authOptions: NextAuthOptions = {
+  providers: [
+    DiscordProvider({
+      clientId: process.env.DISCORD_CLIENT_ID!,
+      clientSecret: process.env.DISCORD_CLIENT_SECRET!,
+      authorization: { params: { scope: 'identify guilds.join' } },
+    }),
+  ],
+  callbacks: {
+    async session({ session, token }) {
+      session.user.id = token.sub;
+      return session;
+    },
+  },
+};
+
+// File: pages/api/stripe/webhook.ts (Stripe Webhook)
+import type { NextApiRequest, NextApiResponse } from 'next';
+import Stripe from 'stripe';
+import { assignRoleToUser } from '@/lib/discord';
+
+export const config = {
+  api: {
+    bodyParser: false,
+  },
+};
+
+const stripeInstance = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: '2023-08-16' });
+
+const buffer = async (readable: any) => {
+  const chunks = [];
+  for await (const chunk of readable) chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+  return Buffer.concat(chunks);
+};
+
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  const sig = req.headers['stripe-signature']!;
+  const buf = await buffer(req);
+  let event;
+
+  try {
+    event = stripeInstance.webhooks.constructEvent(buf, sig, process.env.STRIPE_WEBHOOK_SECRET!);
+  } catch (err: any) {
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object as Stripe.Checkout.Session;
+    const discordId = session.metadata?.discordId;
+    const roleId = session.metadata?.roleId;
+    if (discordId && roleId) {
+      await assignRoleToUser(discordId, roleId);
+    }
+  }
+
+  res.status(200).json({ received: true });
+}
+
+// File: lib/discord.ts
+import fetch from 'node-fetch';
+
+export async function assignRoleToUser(discordId: string, roleId: string) {
+  const botToken = process.env.DISCORD_BOT_TOKEN;
+  const guildId = process.env.DISCORD_GUILD_ID;
+
+  await fetch(`https://discord.com/api/v10/guilds/${guildId}/members/${discordId}/roles/${roleId}`, {
+    method: 'PUT',
+    headers: {
+      Authorization: `Bot ${botToken}`,
+      'Content-Type': 'application/json',
+    },
+  });
+}
+
+// File: pages/api/subscribe.ts (Stripe Checkout Session Creator)
+import { getServerSession } from 'next-auth';
+import { authOptions } from '@/lib/authOptions';
+import Stripe from 'stripe';
+
+const stripeInstance = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: '2023-08-16' });
+
+export default async function handler(req, res) {
+  const session = await getServerSession(req, res, authOptions);
+  if (!session) return res.status(401).json({ error: 'Unauthorized' });
+
+  const discordId = session.user.id;
+  const { priceId, roleId } = req.body;
+
+  const checkoutSession = await stripeInstance.checkout.sessions.create({
+    mode: 'subscription',
+    payment_method_types: ['card'],
+    line_items: [{ price: priceId, quantity: 1 }],
+    metadata: { discordId, roleId },
+    success_url: `${process.env.NEXT_PUBLIC_BASE_URL}/success`,
+    cancel_url: `${process.env.NEXT_PUBLIC_BASE_URL}/cancel`,
+  });
+
+  res.json({ url: checkoutSession.url });
+}
+
+// .env.local (environment config)
+DISCORD_CLIENT_ID=your_client_id
+DISCORD_CLIENT_SECRET=your_client_secret
+DISCORD_BOT_TOKEN=your_bot_token
+DISCORD_GUILD_ID=your_server_id
+STRIPE_SECRET_KEY=your_stripe_secret
+STRIPE_WEBHOOK_SECRET=your_webhook_secret
+NEXT_PUBLIC_BASE_URL=http://localhost:3000
